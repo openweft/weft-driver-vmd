@@ -1,0 +1,43 @@
+version: '3'
+
+# Tasks mirror weft-driver-qemu and weft-router so an operator who jumps
+# between openweft repos keeps the same `task build`, `task test`, `task lint`
+# UX. The cross-build target is `build-openbsd` because that's the only place
+# vmd actually runs -- the macOS host build is the developer-loop binary,
+# nothing more.
+
+vars:
+  VERSION:
+    sh: git describe --tags --always --dirty 2>/dev/null || echo dev
+  COMMIT:
+    sh: git rev-parse --short HEAD 2>/dev/null || echo none
+  DATE:
+    sh: date -u +%Y-%m-%dT%H:%M:%SZ
+
+tasks:
+  build:
+    desc: Build the weft-driver-vmd binary (host arch).
+    cmds:
+      - go build -ldflags "-X main.version={{.VERSION}} -X main.commit={{.COMMIT}} -X main.date={{.DATE}}" -o weft-driver-vmd ./cmd/weft-driver-vmd
+
+  build-openbsd:
+    desc: Cross-build the openbsd/amd64 + openbsd/arm64 binaries (the ones an OpenBSD hypervisor host runs).
+    cmds:
+      - GOOS=openbsd GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version={{.VERSION}}" -o dist/weft-driver-vmd-openbsd-amd64 ./cmd/weft-driver-vmd
+      - GOOS=openbsd GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version={{.VERSION}}" -o dist/weft-driver-vmd-openbsd-arm64 ./cmd/weft-driver-vmd
+
+  test:
+    desc: Run all Go tests with the race detector.
+    cmds:
+      - go test ./... -race
+
+  lint:
+    desc: go vet across the module.
+    cmds:
+      - go vet ./...
+
+  tidy:
+    desc: go mod tidy + go mod verify.
+    cmds:
+      - go mod tidy
+      - go mod verify

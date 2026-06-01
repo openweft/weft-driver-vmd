@@ -1,0 +1,7 @@
+# Build artefacts
+/weft-driver-vmd
+/dist/
+
+# Editor / OS dross
+.DS_Store
+*.swp
