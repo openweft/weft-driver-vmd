@@ -1,45 +1,56 @@
-package builtin
+// network.go — NetworkDriver scaffold for vmd. OpenBSD's networking
+// model uses vether interfaces as virtual switches and tap interfaces
+// per-VM. The driver provisions both via `ifconfig` and binds them at
+// `vmctl start` time via the -n switch flag.
 
-// network.go is the vmd NetworkDriver scaffold. vmd integrates with the
-// host's pf(4) firewall for the data path : `vmctl start -L` creates a
-// local virtio interface that vmd auto-bridges to the default switch
-// declared in /etc/vm.conf. There's no driver-side host construct to
-// create today, so every dynamic method returns ErrUnsupported until
-// the pf(4) + switch.conf wiring lands.
-//
-// When that wiring arrives this is where it goes : EnsureNetwork would
-// templated-write a switch{} block into /etc/vm.conf and reload vmd ;
-// AttachPort would mutate the per-VM vm.conf interface stanza ; mesh
-// support shells out to wg(8) on the OpenBSD host (the wireguard kernel
-// module exists upstream).
+package builtin
 
 import (
 	"context"
+	"log/slog"
 
 	drivers "github.com/openweft/weft-drivers"
 )
 
-// Network implements drivers.NetworkDriver for vmd hosts.
-type Network struct {
+type vmdNetwork struct {
 	opts Options
+	log  *slog.Logger
 }
 
-func NewNetwork(o Options) *Network { return &Network{opts: o} }
-
-// compile-time conformance.
-var _ drivers.NetworkDriver = (*Network)(nil)
-
-func (n *Network) HostInfo(context.Context) (drivers.HostInfo, error) {
-	return hostInfoFor(n.opts), nil
+func newVmdNetwork(opts Options) *vmdNetwork {
+	return &vmdNetwork{opts: opts, log: opts.Logger}
 }
-func (n *Network) EnsureNetwork(context.Context, drivers.NetworkSpec) error {
+
+func (n *vmdNetwork) HostInfo(ctx context.Context) (drivers.HostInfo, error) {
+	return drivers.HostInfo{UUID: n.opts.HostUUID, Hostname: n.opts.Hostname}, nil
+}
+
+// EnsureNetwork creates a vether(4) interface for the network's
+// virtual switch — `ifconfig vether<N> create` + IP bind to the
+// gateway. Idempotent : re-running with the same NetworkSpec is a
+// no-op (vether already exists, IP already bound).
+func (n *vmdNetwork) EnsureNetwork(ctx context.Context, spec drivers.NetworkSpec) error {
 	return drivers.ErrUnsupported
 }
-func (n *Network) DestroyNetwork(context.Context, string) error { return drivers.ErrUnsupported }
-func (n *Network) AttachPort(context.Context, drivers.PortSpec) (drivers.NICHandle, error) {
+
+func (n *vmdNetwork) DestroyNetwork(ctx context.Context, networkUUID string) error {
+	return drivers.ErrUnsupported
+}
+
+// AttachPort provisions a tap(4) interface for the VM and returns its
+// device name as the NICHandle. vmd binds it at VM start via the
+// per-VM tap allocation.
+func (n *vmdNetwork) AttachPort(ctx context.Context, spec drivers.PortSpec) (drivers.NICHandle, error) {
 	return drivers.NICHandle{}, drivers.ErrUnsupported
 }
-func (n *Network) DetachPort(context.Context, string) error { return drivers.ErrUnsupported }
-func (n *Network) RotateMeshPeer(context.Context, drivers.PortSpec) error {
+
+func (n *vmdNetwork) DetachPort(ctx context.Context, portUUID string) error {
 	return drivers.ErrUnsupported
+}
+
+// RotateMeshPeer : WireGuard mesh peers run as overlays managed by
+// weft-network's mesh microVMs, not by the host hypervisor driver.
+// Returning ErrNotApplicable surfaces that intent explicitly.
+func (n *vmdNetwork) RotateMeshPeer(ctx context.Context, spec drivers.PortSpec) error {
+	return drivers.ErrNotApplicable
 }

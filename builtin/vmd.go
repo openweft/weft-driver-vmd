@@ -1,313 +1,306 @@
-// Package builtin implements an OpenBSD vmd(8) HypervisorDriver. The driver
-// is pure Go : it never links the hypervisor in-process, it execs vmctl(8)
-// with arguments composed by args.go. That keeps the binary CGO_ENABLED=0
-// and trivially cross-buildable from a macOS or Linux dev host.
+// vmd.go — HypervisorDriver implementation. The transport is OpenBSD's
+// native imsg(3) protocol over /var/run/vmd.sock — no vmctl(8) exec,
+// no text parsing. See imsg.go + imsg_vmd.go for the wire shapes.
 //
-// vmd is the BSDs' first-party hypervisor : only direct-kernel boot of
-// Linux + OpenBSD guests, no UEFI, no firmware blobs. The HypervisorDriver
-// surface area maps cleanly :
+// The lifecycle binds 1:1 to vmd messages :
 //
-//   CreateVM / StartVM / StopVM / DeleteVM      vmctl start / stop
-//   AttachDisk                                  vmctl create
-//   DetachDisk                                  no-op (vmd binds disks at boot)
-//   AttachNIC / DetachNIC                       drivers.ErrUnsupported
-//                                               (NICs are wired at start time)
-//
-// VM lifetime follows the same transitional convention as weft-driver-vz
-// and weft-driver-qemu : vmUUID is the absolute path to the VM's state
-// directory. By convention that directory holds : kernel, disk.img
-// (optional), mac.txt, name (the vmctl VM name -- derived from
-// filepath.Base(vmDir) at CreateVM time).
+//   CreateVM   : reserve per-VM state under StateDir. No vmd-side
+//                provisioning here ; vmd creates the VM when StartVM
+//                fires IMSG_VMDOP_START_VM_REQUEST. The spec is
+//                persisted as JSON at StateDir/<uuid>/spec.json so
+//                Attach* / StartVM can rebuild the start payload.
+//   StartVM    : load spec, build vmStartParams, send the imsg, wait
+//                for the start-response confirmation.
+//   StopVM     : graceful terminate (force=false) escalating to
+//                force=true on ctx deadline. Polls getInfoVMs until
+//                the VM disappears or reports "stopped".
+//   DeleteVM   : force-terminate + remove StateDir.
+//   AttachDisk : persist into spec ; takes effect on next StartVM
+//                (vmd doesn't support disk hotplug).
+//   AttachNIC  : persist into spec ; same hotplug story.
+
 package builtin
 
 import (
 	"context"
-	"crypto/rand"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
-	"strings"
+	"time"
 
 	drivers "github.com/openweft/weft-drivers"
 )
 
-// Options configures a vmd driver instance.
-type Options struct {
-	// VmctlBinary is the vmctl(8) executable. Empty -> "vmctl" resolved on
-	// PATH. Set to e.g. "doas" + first-arg "vmctl" when the driver runs
-	// non-root and the host's doas.conf grants vmctl access ; the driver
-	// passes VmctlBinary verbatim to exec.Command so the value can be a
-	// shell command with embedded args provided it's tokenised by the
-	// caller (we don't shell-split here -- pass an absolute path or a
-	// wrapper script).
-	VmctlBinary string
-	// DefaultMemMiB is used when a VMSpec leaves MemoryMiB unset.
-	DefaultMemMiB int
-	// DefaultCPUs is used when a VMSpec leaves CPUCount unset. vmctl(8)
-	// itself doesn't expose -c at start time on every OpenBSD release ;
-	// we honour it via vm.conf snippets in a follow-up commit. Stored
-	// here so the HostInfo reporting + future wiring share the field.
-	DefaultCPUs int
-
-	HostUUID string
-	Hostname string
-}
-
-// Hypervisor implements drivers.HypervisorDriver against vmctl(8).
-type Hypervisor struct {
+type vmdHypervisor struct {
 	opts Options
+	log  *slog.Logger
 }
 
-// compile-time conformance -- if drivers.HypervisorDriver grows a method,
-// the build breaks here, which is exactly the point.
-var _ drivers.HypervisorDriver = (*Hypervisor)(nil)
-
-// NewHypervisor constructs the driver, filling in host-derived defaults
-// (vmctl on PATH, 512 MiB, 1 vCPU).
-func NewHypervisor(o Options) *Hypervisor {
-	if o.VmctlBinary == "" {
-		o.VmctlBinary = "vmctl"
-	}
-	if o.DefaultMemMiB == 0 {
-		o.DefaultMemMiB = 512
-	}
-	if o.DefaultCPUs == 0 {
-		o.DefaultCPUs = 1
-	}
-	return &Hypervisor{opts: o}
+func newVmdHypervisor(opts Options) (*vmdHypervisor, error) {
+	return &vmdHypervisor{opts: opts, log: opts.Logger}, nil
 }
 
-// HostInfo returns the host's identity. All four drivers in this bundle
-// share the same HostInfo so the scheduler + audit logs converge.
-func (h *Hypervisor) HostInfo(context.Context) (drivers.HostInfo, error) {
+// HostInfo identifies this driver to the dispatch table. vmd is a
+// per-host hypervisor (one vmd(8) instance per OpenBSD host).
+// Routed through hostInfoFor so Hypervisor + Architecture stay
+// consistent with the qemu/vz/dcs siblings ; the scheduler reads
+// those fields by exact string.
+func (h *vmdHypervisor) HostInfo(ctx context.Context) (drivers.HostInfo, error) {
 	return hostInfoFor(h.opts), nil
 }
 
-// CreateVM provisions the VM's static state : its directory, a stable MAC,
-// and the name file the rest of the lifecycle hangs off. Idempotent --
-// re-creating reuses existing files (matches the weft-driver-qemu contract).
-func (h *Hypervisor) CreateVM(_ context.Context, spec drivers.VMSpec) error {
-	vmDir := spec.UUID
-	if vmDir == "" {
-		return fmt.Errorf("vmd CreateVM: empty VM uuid/dir")
+// dial opens a fresh imsg connection to vmd. We don't pool connections
+// — vmd's protocol is request/response per connection, and the
+// dial+TLS handshake cost on a Unix socket is sub-millisecond. The
+// caller defers .close() on the returned client.
+func (h *vmdHypervisor) dial() (*imsgClient, error) {
+	return dialImsg(h.opts.VmdSocket)
+}
+
+// vmState is the persisted per-VM spec the driver re-reads at every
+// lifecycle call. Lives at StateDir/<uuid>/spec.json.
+type vmState struct {
+	UUID    string   `json:"uuid"`
+	Name    string   `json:"name"`
+	MemMiB  int      `json:"mem_mib"`
+	CPUs    int      `json:"cpus"`
+	Boot    string   `json:"boot,omitempty"` // kernel path, empty = vmd default ("/bsd")
+	Disks   []string `json:"disks"`          // ordered, first = root
+	NICs    []string `json:"nics"`           // ordered, switch names
+}
+
+func (h *vmdHypervisor) vmDir(uuid string) string {
+	return filepath.Join(h.opts.StateDir, uuid)
+}
+
+func (h *vmdHypervisor) specPath(uuid string) string {
+	return filepath.Join(h.vmDir(uuid), "spec.json")
+}
+
+func (h *vmdHypervisor) loadSpec(uuid string) (*vmState, error) {
+	b, err := os.ReadFile(h.specPath(uuid))
+	if err != nil {
+		return nil, err
 	}
-	if err := os.MkdirAll(vmDir, 0o755); err != nil {
-		return fmt.Errorf("vmd CreateVM: %w", err)
+	var s vmState
+	if err := json.Unmarshal(b, &s); err != nil {
+		return nil, fmt.Errorf("decode spec %s: %w", uuid, err)
 	}
-	if err := ensureMAC(vmDir); err != nil {
-		return fmt.Errorf("vmd CreateVM: mac: %w", err)
+	return &s, nil
+}
+
+func (h *vmdHypervisor) saveSpec(s *vmState) error {
+	dir := h.vmDir(s.UUID)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dir, err)
 	}
-	// Persist the vmctl VM name so StartVM/StopVM/DeleteVM share one
-	// derivation. We use the directory's basename so the operator can
-	// correlate `vmctl status` output back to a VM directory.
-	if err := ensureName(vmDir, spec.Name); err != nil {
-		return fmt.Errorf("vmd CreateVM: name: %w", err)
+	b, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode spec: %w", err)
+	}
+	tmp := h.specPath(s.UUID) + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o640); err != nil {
+		return fmt.Errorf("write tmp spec: %w", err)
+	}
+	if err := os.Rename(tmp, h.specPath(s.UUID)); err != nil {
+		return fmt.Errorf("rename spec: %w", err)
 	}
 	return nil
 }
 
-// StartVM assembles a `vmctl start ...` invocation from the VM directory
-// and execs it. vmctl returns once vmd reports the VM as running ; we
-// inherit that contract (no async poll loop needed).
-//
-// Idempotent : a VM already known to vmd (i.e. `vmctl status` lists it as
-// running) is a no-op. We don't probe vmctl status today -- vmctl itself
-// returns a non-zero exit when starting an already-running VM, and the
-// caller already retries on transient errors. This will sharpen once the
-// status probe lands ; the contract is stable.
-func (h *Hypervisor) StartVM(_ context.Context, vmUUID string) error {
-	vmDir := vmUUID
-	name, err := readName(vmDir)
-	if err != nil {
-		return fmt.Errorf("vmd StartVM: %w", err)
+// vmName derives the vmd-side name (≤63 chars + NUL) from a weft UUID.
+// vmd's VMM_MAX_NAME_LEN is 64.
+func vmName(uuid string) string {
+	const prefix = "weft-"
+	if len(uuid) <= 63-len(prefix) {
+		return prefix + uuid
 	}
-	kernel := filepath.Join(vmDir, "kernel")
-	if _, err := os.Stat(kernel); err != nil {
-		return fmt.Errorf("vmd StartVM: kernel not found at %s: %w", kernel, err)
-	}
-	a := startArgs{
-		Name:       name,
-		Kernel:     kernel,
-		MemMiB:     h.opts.DefaultMemMiB,
-		LocalIface: true,
-	}
-	if disk := filepath.Join(vmDir, "disk.img"); fileExists(disk) {
-		a.Disks = append(a.Disks, disk)
-	}
-	args, err := buildStartArgs(a)
-	if err != nil {
-		return fmt.Errorf("vmd StartVM: %w", err)
-	}
-	return h.runVmctl(args)
+	return prefix + uuid[:63-len(prefix)]
 }
 
-// StopVM sends an ACPI shutdown to the guest via `vmctl stop <name>`.
-// Idempotent : a missing VM ('vmctl stop' returns non-zero in that case)
-// is treated as success. The directory-missing branch is the more common
-// idempotence path -- it covers the case where DeleteVM raced StopVM.
-func (h *Hypervisor) StopVM(_ context.Context, vmUUID string) error {
-	vmDir := vmUUID
-	if _, err := os.Stat(vmDir); os.IsNotExist(err) {
-		return nil
+// CreateVM stamps the per-VM spec. vmd has no separate "create" state ;
+// the spec lives on the host until StartVM fires the start-imsg.
+// Re-running CreateVM with the same spec is idempotent.
+func (h *vmdHypervisor) CreateVM(ctx context.Context, spec drivers.VMSpec) error {
+	if spec.UUID == "" {
+		return errors.New("CreateVM: empty uuid")
 	}
-	name, err := readName(vmDir)
+	s := &vmState{
+		UUID:   spec.UUID,
+		Name:   vmName(spec.UUID),
+		MemMiB: spec.MemoryMiB,
+		CPUs:   spec.CPUCount,
+		Boot:   spec.BootRef,
+	}
+	if err := h.saveSpec(s); err != nil {
+		return err
+	}
+	h.log.Info("vmd CreateVM: spec persisted", "uuid", spec.UUID, "name", s.Name)
+	return nil
+}
+
+// StartVM rebuilds the start payload from the persisted spec, sends
+// IMSG_VMDOP_START_VM_REQUEST, waits for the success response. vmd's
+// start is sync from the protocol's POV — the response carries the
+// VM ID, which we discard (the name is our addressing key).
+func (h *vmdHypervisor) StartVM(ctx context.Context, vmUUID string) error {
+	s, err := h.loadSpec(vmUUID)
 	if err != nil {
-		if os.IsNotExist(err) {
+		return fmt.Errorf("StartVM: %w", err)
+	}
+	c, err := h.dial()
+	if err != nil {
+		return fmt.Errorf("StartVM: %w", err)
+	}
+	defer c.close()
+	vmid, err := c.startVM(ctx, vmStartParams{
+		Name:       s.Name,
+		MemMiB:     s.MemMiB,
+		VCPUs:      s.CPUs,
+		BootKernel: s.Boot,
+		Disks:      s.Disks,
+		Nics:       s.NICs,
+	})
+	if err != nil {
+		return fmt.Errorf("vmd startVM: %w", err)
+	}
+	h.log.Info("vmd StartVM: started", "name", s.Name, "vmid", vmid)
+	return nil
+}
+
+// StopVM tries a graceful terminate first ; the caller's ctx deadline
+// triggers escalation to force=true. After the call, poll
+// getInfoVMs() until the VM disappears or reaches state "stopped".
+func (h *vmdHypervisor) StopVM(ctx context.Context, vmUUID string) error {
+	s, err := h.loadSpec(vmUUID)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
-		return fmt.Errorf("vmd StopVM: %w", err)
+		return fmt.Errorf("StopVM: %w", err)
 	}
-	args, err := buildStopArgs(name, false)
+	c, err := h.dial()
 	if err != nil {
-		return fmt.Errorf("vmd StopVM: %w", err)
+		return fmt.Errorf("StopVM: %w", err)
 	}
-	// Best-effort : we deliberately swallow vmctl's exit error here so
-	// "VM unknown" (idempotence) doesn't surface as a hard failure.
-	// Once we probe `vmctl status` we'll distinguish "not found" from
-	// "actually running but stop failed" and bubble the latter.
-	_ = h.runVmctl(args)
-	return nil
-}
-
-// DeleteVM force-stops the VM (in case it's still running) and removes
-// its state directory. Idempotent.
-func (h *Hypervisor) DeleteVM(_ context.Context, vmUUID string) error {
-	vmDir := vmUUID
-	if name, err := readName(vmDir); err == nil {
-		// Force-stop ; ignore the exit status because the VM may already
-		// be gone from vmd's table.
-		if args, e := buildStopArgs(name, true); e == nil {
-			_ = h.runVmctl(args)
+	defer c.close()
+	info, err := c.findVM(ctx, s.Name)
+	if errors.Is(err, ErrVMNotFound) {
+		return nil // already gone
+	}
+	if err != nil {
+		return fmt.Errorf("StopVM: lookup: %w", err)
+	}
+	// Graceful terminate.
+	if err := c.terminateVM(ctx, info.ID, s.Name, false); err != nil {
+		return fmt.Errorf("vmd terminate: %w", err)
+	}
+	// Wait for stop ; escalate to force on ctx deadline.
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		got, err := c.findVM(ctx, s.Name)
+		if errors.Is(err, ErrVMNotFound) {
+			return nil
+		}
+		if err == nil && got.State == "stopped" {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			_ = c.terminateVM(context.Background(), info.ID, s.Name, true)
+			return ctx.Err()
+		case <-time.After(250 * time.Millisecond):
 		}
 	}
-	return os.RemoveAll(vmDir)
+	h.log.Warn("vmd StopVM: escalating to force-terminate", "name", s.Name)
+	return c.terminateVM(ctx, info.ID, s.Name, true)
 }
 
-// AttachDisk ensures a backing file exists for the disk (transitional mode,
-// matching weft-driver-vz + weft-driver-qemu) : when missing and
-// SizeGiB > 0 it execs `vmctl create -s <size> <path>` ; SizeGiB == 0 with
-// a missing file is an error. The boot disk is the file named disk.img
-// in the VM directory by convention.
-func (h *Hypervisor) AttachDisk(_ context.Context, vmUUID string, disk drivers.DiskSpec) error {
-	path := disk.BackingPath
-	if path == "" {
-		path = filepath.Join(vmUUID, "disk.img")
-	}
-	if fileExists(path) {
-		return nil
-	}
-	if disk.SizeGiB <= 0 {
-		return fmt.Errorf("vmd AttachDisk: %s missing and SizeGiB==0", path)
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	args, err := buildCreateDiskArgs(path, disk.SizeGiB)
+// DeleteVM force-terminates the VM and removes its state directory.
+// Idempotent : missing VM / missing dir both return nil.
+func (h *vmdHypervisor) DeleteVM(ctx context.Context, vmUUID string) error {
+	s, err := h.loadSpec(vmUUID)
 	if err != nil {
-		return fmt.Errorf("vmd AttachDisk: %w", err)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("DeleteVM: %w", err)
 	}
-	return h.runVmctl(args)
-}
-
-// DetachDisk is a no-op in the transitional file model. vmd binds disks
-// at boot time and doesn't support disk hot-unplug -- the file stays on
-// disk until DeleteVM (or a future VolumeDriver) reclaims it. Idempotent
-// by definition.
-func (h *Hypervisor) DetachDisk(context.Context, string, string) error { return nil }
-
-// AttachNIC / DetachNIC are unsupported : the vmd driver wires NICs at
-// StartVM time via the `-L` flag (a local virtio interface auto-bridged
-// to the host's switch), not via hot-plug. Same call-site convention as
-// weft-driver-qemu's user-mode networking -- the Network driver returns
-// ErrUnsupported here so callers get a clear "patch welcome" signal.
-func (h *Hypervisor) AttachNIC(context.Context, string, drivers.NICHandle) error {
-	return drivers.ErrUnsupported
-}
-func (h *Hypervisor) DetachNIC(context.Context, string, string) error {
-	return drivers.ErrUnsupported
-}
-
-// runVmctl is the single seam every shell-out goes through. Kept on the
-// receiver so we can in a follow-up swap it for a fake in unit tests
-// without touching every caller. Stdout/stderr are wired to the parent's
-// streams so vmctl's error messages land in the agent log.
-func (h *Hypervisor) runVmctl(args []string) error {
-	bin := h.opts.VmctlBinary
-	if bin == "" {
-		bin = "vmctl"
+	c, err := h.dial()
+	if err == nil {
+		defer c.close()
+		if info, err := c.findVM(ctx, s.Name); err == nil {
+			_ = c.terminateVM(ctx, info.ID, s.Name, true)
+		}
 	}
-	cmd := exec.Command(bin, args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("vmctl %s: %w", strings.Join(args, " "), err)
+	if err := os.RemoveAll(h.vmDir(vmUUID)); err != nil {
+		return fmt.Errorf("rm %s: %w", h.vmDir(vmUUID), err)
 	}
+	h.log.Info("vmd DeleteVM: removed", "uuid", vmUUID)
 	return nil
 }
 
-// ----- helpers ----------------------------------------------------------
-
-// ensureMAC writes a stable locally-administered MAC into <vmDir>/mac.txt
-// the first time the VM is created. Subsequent CreateVM calls reuse it,
-// which is what the idempotence contract requires.
-func ensureMAC(vmDir string) error {
-	p := filepath.Join(vmDir, "mac.txt")
-	if fileExists(p) {
-		return nil
-	}
-	b := make([]byte, 6)
-	if _, err := rand.Read(b); err != nil {
-		return err
-	}
-	b[0] = (b[0] | 0x02) & 0xfe // locally administered, unicast
-	mac := fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4], b[5])
-	return os.WriteFile(p, []byte(mac), 0o600)
-}
-
-// ensureName persists the vmctl VM name. If the spec leaves Name empty we
-// fall back to the directory's basename so `vmctl status` output is at
-// least debuggable.
-func ensureName(vmDir, specName string) error {
-	p := filepath.Join(vmDir, "name")
-	if fileExists(p) {
-		return nil
-	}
-	n := specName
-	if n == "" {
-		n = filepath.Base(vmDir)
-	}
-	return os.WriteFile(p, []byte(n), 0o600)
-}
-
-// readName returns the persisted vmctl name. Used by every method that
-// shells out to vmctl so one CreateVM-time decision drives the rest of
-// the lifecycle.
-func readName(vmDir string) (string, error) {
-	b, err := os.ReadFile(filepath.Join(vmDir, "name"))
+// AttachDisk records the disk path in the persisted spec. vmd has no
+// disk-hotplug imsg ; the binding takes effect on the next StartVM.
+func (h *vmdHypervisor) AttachDisk(ctx context.Context, vmUUID string, disk drivers.DiskSpec) error {
+	s, err := h.loadSpec(vmUUID)
 	if err != nil {
-		return "", err
+		return fmt.Errorf("AttachDisk: %w", err)
 	}
-	return strings.TrimSpace(string(b)), nil
-}
-
-func fileExists(p string) bool {
-	_, err := os.Stat(p)
-	return err == nil
-}
-
-// driverArch normalises GOARCH into the labels openweft uses everywhere
-// (arm64 / amd64), so HostInfo.Architecture is comparable across drivers.
-func driverArch(goarch string) string {
-	switch goarch {
-	case "arm64", "amd64", "riscv64", "loongarch64":
-		return goarch
-	default:
-		return goarch
+	for _, d := range s.Disks {
+		if d == disk.BackingPath {
+			return nil
+		}
 	}
+	s.Disks = append(s.Disks, disk.BackingPath)
+	return h.saveSpec(s)
 }
 
-// hostArchForGOARCH returns the canonical openweft arch label for the
-// running binary. Wrapped so tests don't need to set GOARCH.
-func hostArchForGOARCH() string { return driverArch(runtime.GOARCH) }
+func (h *vmdHypervisor) DetachDisk(ctx context.Context, vmUUID, volumeUUID string) error {
+	s, err := h.loadSpec(vmUUID)
+	if err != nil {
+		return fmt.Errorf("DetachDisk: %w", err)
+	}
+	out := make([]string, 0, len(s.Disks))
+	for _, d := range s.Disks {
+		if d != volumeUUID {
+			out = append(out, d)
+		}
+	}
+	s.Disks = out
+	return h.saveSpec(s)
+}
+
+// AttachNIC records a switch name in the persisted spec. Effect on
+// next StartVM (no NIC hotplug in vmd).
+func (h *vmdHypervisor) AttachNIC(ctx context.Context, vmUUID string, nic drivers.NICHandle) error {
+	s, err := h.loadSpec(vmUUID)
+	if err != nil {
+		return fmt.Errorf("AttachNIC: %w", err)
+	}
+	for _, n := range s.NICs {
+		if n == nic.Device {
+			return nil
+		}
+	}
+	s.NICs = append(s.NICs, nic.Device)
+	return h.saveSpec(s)
+}
+
+func (h *vmdHypervisor) DetachNIC(ctx context.Context, vmUUID, nicDevice string) error {
+	s, err := h.loadSpec(vmUUID)
+	if err != nil {
+		return fmt.Errorf("DetachNIC: %w", err)
+	}
+	out := make([]string, 0, len(s.NICs))
+	for _, n := range s.NICs {
+		if n != nicDevice {
+			out = append(out, n)
+		}
+	}
+	s.NICs = out
+	return h.saveSpec(s)
+}

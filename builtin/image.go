@@ -1,38 +1,42 @@
-package builtin
+// image.go — ImageDriver scaffold for vmd. Images are pulled from an
+// OCI registry, unpacked, and converted to raw disk files under
+// StateDir/images/. vmd consumes raw disks at boot through the -d
+// flag of `vmctl start`.
 
-// image.go is the vmd ImageDriver scaffold. Image caching (OCI / kernel
-// artifacts) is shared platform logic that will be wrapped here once the
-// imagestore is factored out of weft. For now Pull/LocalPath/Delete return
-// ErrUnsupported and InCache reports false so the scheduler always
-// fetches synchronously -- same staging as weft-driver-qemu.
+package builtin
 
 import (
 	"context"
+	"log/slog"
 
 	drivers "github.com/openweft/weft-drivers"
 )
 
-// ImageOptions configures the image cache driver.
-type ImageOptions struct {
-	Options
-	CacheDir string
+type vmdImage struct {
+	opts Options
+	log  *slog.Logger
 }
 
-// Image implements drivers.ImageDriver for vmd hosts.
-type Image struct {
-	opts     Options
-	cacheDir string
+func newVmdImage(opts Options) *vmdImage {
+	return &vmdImage{opts: opts, log: opts.Logger}
 }
 
-func NewImage(o ImageOptions) *Image { return &Image{opts: o.Options, cacheDir: o.CacheDir} }
-
-// compile-time conformance.
-var _ drivers.ImageDriver = (*Image)(nil)
-
-func (i *Image) HostInfo(context.Context) (drivers.HostInfo, error) {
-	return hostInfoFor(i.opts), nil
+func (i *vmdImage) HostInfo(ctx context.Context) (drivers.HostInfo, error) {
+	return drivers.HostInfo{UUID: i.opts.HostUUID, Hostname: i.opts.Hostname}, nil
 }
-func (i *Image) Pull(context.Context, string) error                { return drivers.ErrUnsupported }
-func (i *Image) LocalPath(context.Context, string) (string, error) { return "", drivers.ErrUnsupported }
-func (i *Image) Delete(context.Context, string) error              { return drivers.ErrUnsupported }
-func (i *Image) InCache(context.Context, string) (bool, error)     { return false, nil }
+
+func (i *vmdImage) Pull(ctx context.Context, ref string) error {
+	return drivers.ErrUnsupported
+}
+
+func (i *vmdImage) LocalPath(ctx context.Context, ref string) (string, error) {
+	return "", drivers.ErrUnsupported
+}
+
+func (i *vmdImage) Delete(ctx context.Context, ref string) error {
+	return drivers.ErrUnsupported
+}
+
+func (i *vmdImage) InCache(ctx context.Context, ref string) (bool, error) {
+	return false, drivers.ErrUnsupported
+}

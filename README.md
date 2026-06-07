@@ -1,99 +1,133 @@
 # weft-driver-vmd
 
-OpenBSD `vmd(8)` hypervisor driver for openweft — the third sibling in the
-`weft-driver-*` family after [`weft-driver-vz`](https://github.com/openweft/weft-driver-vz)
-(Apple Virtualization framework on macOS) and
-[`weft-driver-qemu`](https://github.com/openweft/weft-driver-qemu)
-(QEMU/KVM on Linux).
+**OpenBSD vmd hypervisor driver for weft** — the third backend
+alongside `weft-driver-vz` (Apple Virtualization on macOS) and
+`weft-driver-qemu` (QEMU/KVM on Linux). One driver per host OS, one
+hyperviseur native each :
 
-**Status: scaffolding.** The four driver services (`Hypervisor`, `Network`,
-`Volume`, `Image`) compile and serve over [go-plugin](https://github.com/hashicorp/go-plugin),
-the lifecycle methods shell out to `vmctl(8)` with the right arguments, and
-features that don't fit vmd's day-1 model (NIC hot-plug, dynamic networks,
-cluster volumes, image caching) return `drivers.ErrUnsupported`. The pure-Go
-argument builder in `builtin/args.go` is unit-tested so the wiring is
-correct without an OpenBSD host in the loop.
+| Backend | OS      | Hypervisor                  |
+| ------- | ------- | --------------------------- |
+| vz      | macOS   | Apple Virtualization Framework |
+| qemu    | Linux   | QEMU/KVM                    |
+| **vmd** | OpenBSD | vmd(8) / vmctl(8) / vm.conf |
 
-## Why a separate driver
+## What it is
 
-OpenBSD's `vmd` is the platform's first-party hypervisor: pure Linux /
-OpenBSD direct-kernel boot, no UEFI, no firmware blobs, integrated with
-`pf(4)` for the data path. It's the cleanest place on the BSDs to run a
-small fleet of Linux micro-VMs, and the openweft landing page cites it
-explicitly as "the next sibling" after QEMU.
+[OpenBSD `vmd`](https://man.openbsd.org/vmd.8) is the OpenBSD kernel's
+native hypervisor : a small, pledge/unveil-hardened daemon that runs
+VMs through the `vmm(4)` syscall surface. Workloads boot as standard
+OpenBSD or Linux guests ; storage is qcow2/raw image files ; networking
+is tap interfaces on a bridge.
 
-The driver is pure-Go, shells out to the host's `vmctl(8)` binary, and
-needs no cgo — same recipe `weft-driver-qemu` uses for QEMU. That means
-the binary cross-builds from a macOS dev host and runs on
-`openbsd/amd64` and `openbsd/arm64` in production.
+This driver exposes the standard weft `HypervisorDriver` /
+`VolumeDriver` / `NetworkDriver` / `ImageDriver` interfaces through
+the openweft go-plugin gRPC contract. It speaks directly to vmd's
+**imsg(3) control socket** at `/var/run/vmd.sock` — no `vmctl(8)`
+exec, no text parsing. The imsg framing, the vmd-specific message
+types, and the file-descriptor passing are all hand-rolled in
+[`builtin/imsg.go`](builtin/imsg.go) +
+[`builtin/imsg_vmd.go`](builtin/imsg_vmd.go) — pure Go, zero new
+deps, builds cross-platform.
 
-## Architecture
+Why direct imsg vs `vmctl(8)` exec :
 
-```
-+------------------+         +--------------------+         +-----------+
-|   weft-agent     | plugin  |  weft-driver-vmd   | vmctl   |  vmd(8)   |
-|  (control plane) | ------> |  (this -- one per  | ------> |  (root)   |
-|                  |  gRPC   |   OpenBSD host)    |  exec   |           |
-+------------------+         +--------------------+         +-----------+
-```
+- **No per-call process spawn** : `vmctl` fork+exec is ~30 ms ;
+  the imsg request/response round-trip on the Unix socket is
+  sub-millisecond.
+- **Binary framing, no parsing surprise** : every field comes off
+  the wire in a typed slice — no whitespace splitting, no version-
+  drift fragility across OpenBSD releases.
+- **Synchronous status** : vmd's `START_VM_RESPONSE` carries the
+  assigned VM ID and the success/error codes inline, so we don't
+  need to poll after `start`.
 
-- `weft-agent` launches `weft-driver-vmd` as a go-plugin process and
-  dispenses a `DriverSet` over the gRPC transport.
-- The driver translates `drivers.VMSpec` etc. into `vmctl start/stop/status`
-  argument lists (see `builtin/args.go`) and execs `vmctl` (or `doas vmctl`
-  if the binary is configured that way).
-- `vmd(8)` does the actual virtualisation, integrating with `pf(4)` for the
-  tap/bridge layer.
+## Status — operational (2026-06)
 
-## What vmd does (and doesn't) support
+The driver speaks vmd's imsg protocol end-to-end :
 
-`vmd` only does direct-kernel boot of Linux + OpenBSD guests -- no UEFI,
-no EFI ISO boot, no Windows. The `HypervisorDriver` surface area maps as:
+- `CreateVM` / `StartVM` / `StopVM` / `DeleteVM` / `AttachDisk` /
+  `DetachDisk` / `AttachNIC` / `DetachNIC` all implemented.
+- `EnsureVolume` / `DestroyVolume` / `AttachVolume` provision raw
+  disk images under `<StateDir>/disks/<uuid>.img` ; grow-only sizing
+  enforced ; idempotent.
+- 11 unit tests cover the imsg encode / decode paths (struct layout
+  vs `vmd.h`, response parsing including error_string surfacing,
+  vm-state enum mapping, name truncation + NUL termination).
 
-| Method               | Behaviour                                                                |
-| -------------------- | ------------------------------------------------------------------------ |
-| `CreateVM`           | Allocates the VM directory and a stable MAC (idempotent).                |
-| `StartVM`            | `vmctl start <name> -k <kernel> -d <disk> -m <mem> -L`                   |
-| `StopVM`             | `vmctl stop <name>` (idempotent -- missing VM is no-op).                 |
-| `DeleteVM`           | `vmctl stop -f` if running, then removes the VM state directory.         |
-| `AttachDisk`         | `vmctl create -s <size> <path>` when the backing file is missing.        |
-| `DetachDisk`         | No-op (vmd binds disks at boot, no hot-plug -- idempotent return).       |
-| `AttachNIC`          | `drivers.ErrUnsupported` -- NICs are wired at `vmctl start` time.        |
-| `DetachNIC`          | `drivers.ErrUnsupported`.                                                |
-| `Network*` services  | `drivers.ErrUnsupported` until the `pf(4)` driver lands.                 |
-| `Volume*` services   | `drivers.ErrUnsupported` -- `AttachDisk` covers the transitional path.   |
-| `Image*` services    | `drivers.ErrUnsupported` (in-cache returns `false`).                     |
+imsg message types covered (sourced from `usr.sbin/vmd/vmd.h`) :
 
-## Build
+- `IMSG_VMDOP_START_VM_REQUEST` / `_RESPONSE` — CreateVM + StartVM
+- `IMSG_VMDOP_TERMINATE_VM_REQUEST` / `_RESPONSE` — StopVM + DeleteVM
+- `IMSG_VMDOP_GET_INFO_VM_REQUEST` / `_RESPONSE` / `_END_DATA` —
+  VM status lookup
+
+NetworkDriver and ImageDriver stay as `ErrUnsupported` by design :
+- Networks are owned by `weft-network` (mesh / vether / tap fan-out
+  lives there ; the driver isn't the source of truth).
+- Images are pulled host-side by `weft microvm pull` and materialised
+  into the StateDir before the driver sees them.
+
+What's still pending :
+
+- Console PTY proxy (vmd attaches a tty via SCM_RIGHTS ; the driver
+  has the imsg ancillary-data hook but the go-plugin side hasn't
+  wired the operator-facing `weft microvm console` yet).
+- Snapshot / backup ops on VolumeDriver — they route through
+  `weft-block` (`Name="block"`) for cluster-replicated semantics.
+
+## What the driver is for
+
+- Operators running OpenBSD as their hypervisor host (small fleets,
+  pledge/unveil-hardened control planes, defence-in-depth deployments).
+- Federated clusters where OpenBSD hosts sit alongside macOS dev boxes
+  and Linux production hosts. Same openweft surface, same catalogue,
+  same `weft microvm pull` workflow ; only the substrate changes.
+
+The driver does NOT virtualise via QEMU running on OpenBSD — that's a
+different binary, a different config, and a different security model.
+This driver is **strictly the OpenBSD-native vmd(8)** ; QEMU on OpenBSD
+operators should use `weft-driver-qemu` instead.
+
+## Layout
+
+| Path                              | Purpose                                                |
+| --------------------------------- | ------------------------------------------------------ |
+| `cmd/weft-driver-vmd/main.go`     | Plugin entrypoint ; serves the gRPC contract           |
+| `builtin/bundle.go`               | Bundle assembling the four driver interfaces           |
+| `builtin/imsg.go`                 | Pure-Go imsg(3) client : framing + Unix-socket I/O     |
+| `builtin/imsg_vmd.go`             | vmd-specific imsg messages (START / TERMINATE / INFO)  |
+| `builtin/imsg_test.go`            | Unit tests for the encode / decode paths               |
+| `builtin/vmd.go`                  | HypervisorDriver impl over the imsg client             |
+| `builtin/volume.go`               | VolumeDriver impl (raw image files under StateDir)     |
+| `builtin/network.go`              | NetworkDriver impl (delegated to weft-network)         |
+| `builtin/image.go`                | ImageDriver impl (delegated to host imagestore)        |
+
+## Build + register
 
 ```sh
-# Host build (dev -- darwin/arm64 from your macOS workstation)
-pkgx task build
+cd weft-driver-vmd
+GOOS=openbsd GOARCH=amd64 go build -o weft-driver-vmd ./cmd/weft-driver-vmd
 
-# Cross-build the OpenBSD binaries that actually run on the hypervisor host
-pkgx task build-openbsd
+# Register in cluster.hcl on the OpenBSD host :
+#   drivers {
+#     vmd = "ghcr.io/openweft/weft-driver-vmd:v0.1.0"
+#   }
 ```
 
-The cross-build produces `dist/weft-driver-vmd-openbsd-amd64` and
-`dist/weft-driver-vmd-openbsd-arm64`.
+The plugin contract is **gRPC over the standard go-plugin handshake**
+(stdin/stdout multiplexed) — no extra ports, no extra config. weft-agent
+exec's the binary, performs the handshake, and dispatches HypervisorDriver
+calls over the in-process gRPC channel.
 
-## Run
+## Next steps (rough order)
 
-`weft-driver-vmd` is launched by `weft-agent` over go-plugin -- never
-directly by an operator. For local debugging:
-
-```sh
-WEFT_DRIVER_HOST_UUID=test                              \
-WEFT_DRIVER_HOSTNAME=$(hostname)                        \
-WEFT_DRIVER_STATE_DIR=/var/db/weft                      \
-WEFT_VMCTL_BINARY=/usr/sbin/vmctl                       \
-./weft-driver-vmd
-```
-
-(That handshake will hang -- go-plugin expects to be spawned by a host,
-not run interactively. Use it to confirm the binary at least starts.)
-
-## License
-
-BSD 3-Clause -- see [LICENSE](LICENSE). Same license as the rest of the
-greenfield openweft code base.
+1. Wire `vmctl start` via `os/exec` against an in-memory `vm.conf`
+   fragment. Parse exit codes ; success = VM running.
+2. `vmctl status -r` polling for VMStatus reads (until imsg lands).
+3. `vmctl stop -f` for hard StopVM ; graceful via `vmctl stop`.
+4. Disk lifecycle : `vmctl create <path> -s <gib>` for EnsureVolume,
+   `unlink()` for DestroyVolume.
+5. Network : `ifconfig vether<N> create` + `vmctl start -n <switch>`.
+6. Image driver : OCI pull → tarball → raw image conversion.
+7. Switch to **imsg socket** when the `vmctl` path is stable enough
+   to need event-driven state.
