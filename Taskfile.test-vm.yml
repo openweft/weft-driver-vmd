@@ -1,0 +1,334 @@
+version: '3'
+
+# Reproducible QEMU/OpenBSD test VM for weft-driver-vmd. Boots from a
+# modified install ISO that runs `bsd.rd auto` unattended, fetches a
+# minimal install.conf over HTTP (host:80) to lay down disk + sets,
+# then on first user boot fires weft-firstboot to provision hostname /
+# users / SSH keys / packages / runcmds from a single HCL config.
+#
+# Runs on the macOS HOST — not inside the Tart dev VM (HVF unavailable
+# nested). See env_no_nested_virt memory.
+#
+# Prerequisites (one-time) :
+#   brew install socket_vmnet
+#   sudo brew services start socket_vmnet
+#   # pkgx provides qemu + xorriso ; python3 ships with macOS
+#
+# Lifecycle :
+#   task tools-check
+#   task install        # one-shot interactive ISO + autoinstall ; ends in shutdown
+#   task up             # boot installed VM ; serial console blocks
+#   task ssh            # SSH into VM via vmnet DHCP lease (from another term)
+#   task down           # graceful ACPI shutdown via QMP
+#   task clean          # nuke disk + ISOs + firstboot binary
+
+vars:
+  OPENBSD_VERSION: '7.6'
+  OPENBSD_VERSION_NODOTS: '76'
+  STATE_DIR: '{{.HOME}}/.weft-driver-vmd/test-vm'
+  HTTP_DIR: '{{.STATE_DIR}}/http'
+  DISK_SIZE: 20G
+  MEM_MIB: 2048
+  CPUS: 2
+  GUEST_HOSTNAME: vmd-test
+  GUEST_USER: openbsd
+  GUEST_MAC: '52:54:00:c0:ff:ee'
+  VMNET_SOCK: /var/run/socket_vmnet
+  HTTP_PORT: 80
+  # weft-firstboot v0.2.0 binary for openbsd/amd64 — pulled once into
+  # the HTTP-served dir so the VM curls it on first boot.
+  FIRSTBOOT_VERSION: v0.2.0
+  FIRSTBOOT_URL: 'https://github.com/openweft/weft-firstboot/releases/download/{{.FIRSTBOOT_VERSION}}/weft-firstboot-openbsd-amd64'
+
+  HOST_ARCH:
+    sh: |
+      case "$(uname -m)" in
+        arm64)  echo arm64  ;;
+        x86_64) echo amd64  ;;
+        *) echo "unsupported host arch : $(uname -m)" >&2; exit 1 ;;
+      esac
+  QEMU_BIN:
+    sh: |
+      case "$(uname -m)" in
+        arm64) echo qemu-system-aarch64 ;;
+        x86_64) echo qemu-system-x86_64 ;;
+      esac
+  EDK2_FW:
+    sh: |
+      for p in /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
+               /usr/local/share/qemu/edk2-aarch64-code.fd; do
+        [ -f "$p" ] && { echo "$p"; exit; }
+      done
+      echo ''
+  SOCKET_VMNET_CLIENT:
+    sh: |
+      for p in /opt/socket_vmnet/bin/socket_vmnet_client \
+               /usr/local/opt/socket_vmnet/bin/socket_vmnet_client; do
+        [ -x "$p" ] && { echo "$p"; exit; }
+      done
+      echo 'socket_vmnet_client not found ; brew install socket_vmnet' >&2
+      exit 1
+  SSH_PUBKEY:
+    sh: |
+      for f in ~/.ssh/id_ed25519.pub ~/.ssh/id_rsa.pub; do
+        [ -f "$f" ] && { cat "$f"; exit; }
+      done
+      echo 'no SSH public key found in ~/.ssh/' >&2; exit 1
+
+  ISO_STOCK:  '{{.STATE_DIR}}/install{{.OPENBSD_VERSION_NODOTS}}-{{.HOST_ARCH}}.iso'
+  ISO_AUTO:   '{{.STATE_DIR}}/install{{.OPENBSD_VERSION_NODOTS}}-{{.HOST_ARCH}}-autoinstall.iso'
+  DISK_PATH:  '{{.STATE_DIR}}/disk.qcow2'
+  EFI_VARS:   '{{.STATE_DIR}}/edk2-vars.fd'
+  QMP_SOCK:   '{{.STATE_DIR}}/qmp.sock'
+  HTTP_PID_F: '{{.STATE_DIR}}/http.pid'
+
+tasks:
+  default:
+    cmds: [task --list-all]
+
+  tools-check:
+    cmds:
+      - command -v pkgx >/dev/null || { echo 'install pkgx : curl -fsS https://pkgx.sh | sh' >&2; exit 1; }
+      - command -v python3 >/dev/null || { echo 'python3 missing' >&2; exit 1; }
+      - test -S {{.VMNET_SOCK}} || { echo 'socket_vmnet not running — sudo brew services start socket_vmnet' >&2; exit 1; }
+      - echo 'tooling OK'
+
+  state-dir:
+    cmds: [mkdir -p {{.STATE_DIR}} {{.HTTP_DIR}}]
+    status: [test -d {{.HTTP_DIR}}]
+
+  iso-fetch:
+    desc: Download the stock OpenBSD install ISO (~700 MiB, one-shot)
+    deps: [state-dir]
+    cmds:
+      - |
+        curl -fL --progress-bar \
+          'https://cdn.openbsd.org/pub/OpenBSD/{{.OPENBSD_VERSION}}/{{.HOST_ARCH}}/install{{.OPENBSD_VERSION_NODOTS}}.iso' \
+          -o {{.ISO_STOCK}}
+    status: [test -s {{.ISO_STOCK}}]
+
+  iso-autoinstall:
+    desc: Repack the install ISO with `boot bsd.rd auto` in /etc/boot.conf
+    deps: [iso-fetch]
+    cmds:
+      - |
+        set -eu
+        work={{.STATE_DIR}}/iso-work
+        rm -rf "$work" && mkdir -p "$work"
+        cat > "$work/boot.conf" <<EOF
+        set tty com0
+        stty com0 115200
+        boot bsd.rd auto
+        EOF
+        pkgx +xorriso.libburnia-project.org xorriso \
+          -indev {{.ISO_STOCK}} -outdev {{.ISO_AUTO}} \
+          -boot_image any replay \
+          -update "$work/boot.conf" /etc/boot.conf
+        rm -rf "$work"
+    status: [test {{.ISO_AUTO}} -nt {{.ISO_STOCK}}]
+
+  disk-create:
+    deps: [state-dir]
+    cmds:
+      - pkgx +qemu.org qemu-img create -f qcow2 {{.DISK_PATH}} {{.DISK_SIZE}}
+      - |
+        if [ '{{.HOST_ARCH}}' = arm64 ] && [ ! -s {{.EFI_VARS}} ]; then
+          dd if=/dev/zero of={{.EFI_VARS}} bs=1m count=64 2>/dev/null
+        fi
+    status: [test -s {{.DISK_PATH}}]
+
+  firstboot-fetch:
+    desc: Download the weft-firstboot openbsd/amd64 binary into HTTP_DIR
+    deps: [state-dir]
+    cmds:
+      - |
+        curl -fL --progress-bar -o {{.HTTP_DIR}}/weft-firstboot \
+          '{{.FIRSTBOOT_URL}}'
+        chmod 0755 {{.HTTP_DIR}}/weft-firstboot
+    status: [test -s {{.HTTP_DIR}}/weft-firstboot]
+
+  user-data:
+    desc: Render the weft-firstboot HCL config served over HTTP at first boot
+    deps: [state-dir]
+    cmds:
+      - |
+        cat > {{.HTTP_DIR}}/user-data <<EOF
+        hostname = "{{.GUEST_HOSTNAME}}"
+
+        user "{{.GUEST_USER}}" {
+          ssh_authorized_keys = ["{{.SSH_PUBKEY}}"]
+          groups              = ["operator"]
+          doas                = true
+          shell               = "/bin/ksh"
+        }
+
+        user "root" {
+          ssh_authorized_keys = ["{{.SSH_PUBKEY}}"]
+        }
+
+        write_file "/etc/doas.conf" {
+          content = "permit nopass keepenv :wheel\n"
+          mode    = "0640"
+          owner   = "root"
+          group   = "wheel"
+        }
+
+        packages = [
+          "git",
+          "go",
+        ]
+
+        runcmd = [
+          "rcctl enable ntpd",
+          "rcctl start ntpd",
+          "rcctl enable sshd",
+        ]
+        EOF
+
+  install-config:
+    desc: Render the bsd.rd autoinstall install.conf (disk layout + sets only)
+    deps: [state-dir]
+    cmds:
+      - |
+        # install.conf is minimal : NO users/SSH (weft-firstboot does
+        # that at first boot via the same HTTP server). We only ask
+        # OpenBSD's installer to lay down the filesystem + extract
+        # sets + drop the firstboot binary as /etc/rc.firstboot so it
+        # fires once at next reboot.
+        cat > {{.HTTP_DIR}}/install.conf <<EOF
+        System hostname = {{.GUEST_HOSTNAME}}
+        Password for root = *************
+        Allow root ssh login = no
+        Setup a user = no
+        What timezone are you in = UTC
+        Network interfaces = vio0
+        IPv4 address for vio0 = dhcp
+        IPv6 address for vio0 = none
+        DNS domain name = local
+        Which disk is the root disk = sd0
+        Use (W)hole disk MBR, whole disk (G)PT or (E)dit? = whole
+        URL to autopartitioning template for disklabel = (none)
+        Set name(s) = +* -x* -game* done
+        Directory does not contain SHA256.sig. Continue without verification = yes
+        Location of sets = cd0
+        Pathname to the sets = {{.OPENBSD_VERSION_NODOTS}}/{{.HOST_ARCH}}
+        Set name(s) = done
+        Ready to install = yes
+        URL to autoinstall.tail file = http://10.0.2.2/autoinstall.tail
+        EOF
+        # autoinstall.tail is sourced as /bin/sh AFTER install completes
+        # but BEFORE reboot. We use it to bake weft-firstboot into rc(8)
+        # so it fires on the next boot.
+        cat > {{.HTTP_DIR}}/autoinstall.tail <<EOF
+        set -eu
+        ftp -o /mnt/usr/local/bin/weft-firstboot http://10.0.2.2/weft-firstboot
+        chmod 0755 /mnt/usr/local/bin/weft-firstboot
+        # rc.local fires once at every boot ; weft-firstboot's sentinel
+        # makes runs after the first into no-ops.
+        cat > /mnt/etc/rc.local <<'RCEOF'
+        if [ -x /usr/local/bin/weft-firstboot ]; then
+          /usr/local/bin/weft-firstboot apply \\
+            --datasource http://10.0.2.2/user-data \\
+            >> /var/log/weft-firstboot.log 2>&1 || true
+        fi
+        RCEOF
+        chmod 0755 /mnt/etc/rc.local
+        EOF
+
+  install:
+    desc: Auto-install OpenBSD + bake weft-firstboot into rc.local
+    deps: [tools-check, iso-autoinstall, disk-create, firstboot-fetch, user-data, install-config]
+    cmds:
+      - |
+        set -eu
+        # HTTP server on host:80 serves install.conf + autoinstall.tail
+        # + user-data + weft-firstboot. Bind 127.0.0.1 — SLIRP routes
+        # 10.0.2.2 → host loopback so the VM still reaches it.
+        sudo -b sh -c "python3 -m http.server {{.HTTP_PORT}} \
+          --bind 127.0.0.1 --directory {{.HTTP_DIR}} >/dev/null 2>&1 & \
+          echo \$! > {{.HTTP_PID_F}}"
+        trap "sudo kill \$(cat {{.HTTP_PID_F}} 2>/dev/null) 2>/dev/null || true; rm -f {{.HTTP_PID_F}}" EXIT
+        sleep 1
+        common="-smp {{.CPUS}} -m {{.MEM_MIB}} \
+          -drive file={{.DISK_PATH}},if=virtio,format=qcow2 \
+          -drive file={{.ISO_AUTO}},if=virtio,format=raw,media=cdrom,readonly=on \
+          -boot d \
+          -netdev user,id=net0,hostname={{.GUEST_HOSTNAME}} \
+          -device virtio-net-pci,netdev=net0 \
+          -nographic -serial mon:stdio"
+        if [ '{{.HOST_ARCH}}' = arm64 ]; then
+          [ -n '{{.EDK2_FW}}' ] || { echo 'edk2-aarch64-code.fd missing' >&2; exit 1; }
+          args="-machine virt,accel=hvf,highmem=on -cpu host \
+            -drive if=pflash,format=raw,readonly=on,file={{.EDK2_FW}} \
+            -drive if=pflash,format=raw,file={{.EFI_VARS}} $common"
+        else
+          args="-machine q35,accel=hvf -cpu host $common"
+        fi
+        pkgx +qemu.org {{.QEMU_BIN}} $args
+        echo 'install complete ; weft-firstboot will run on first boot'
+        echo 'next : task up'
+
+  up:
+    desc: Boot the installed VM ; weft-firstboot reapplies on every boot (sentinel no-ops it)
+    deps: [tools-check, disk-create, firstboot-fetch, user-data]
+    cmds:
+      - |
+        set -eu
+        test -s {{.DISK_PATH}} || { echo 'no disk ; run `task install` first' >&2; exit 1; }
+        # HTTP server stays up : weft-firstboot in the VM tries to
+        # fetch user-data on first boot via the rc.local stanza we
+        # baked in. Subsequent boots short-circuit on the sentinel
+        # at /var/lib/weft-firstboot/applied so the HTTP server is
+        # only strictly required for the very first boot.
+        sudo -b sh -c "python3 -m http.server {{.HTTP_PORT}} \
+          --bind 127.0.0.1 --directory {{.HTTP_DIR}} >/dev/null 2>&1 & \
+          echo \$! > {{.HTTP_PID_F}}"
+        trap "sudo kill \$(cat {{.HTTP_PID_F}} 2>/dev/null) 2>/dev/null || true; rm -f {{.HTTP_PID_F}}" EXIT
+        rm -f {{.QMP_SOCK}}
+        common="-smp {{.CPUS}} -m {{.MEM_MIB}} \
+          -drive file={{.DISK_PATH}},if=virtio,format=qcow2 \
+          -boot c \
+          -netdev socket,id=net0,fd=3 \
+          -device virtio-net-pci,netdev=net0,mac={{.GUEST_MAC}} \
+          -qmp unix:{{.QMP_SOCK}},server=on,wait=off \
+          -nographic -serial mon:stdio"
+        if [ '{{.HOST_ARCH}}' = arm64 ]; then
+          args="-machine virt,accel=hvf,highmem=on -cpu host \
+            -drive if=pflash,format=raw,readonly=on,file={{.EDK2_FW}} \
+            -drive if=pflash,format=raw,file={{.EFI_VARS}} $common"
+        else
+          args="-machine q35,accel=hvf -cpu host $common"
+        fi
+        sudo {{.SOCKET_VMNET_CLIENT}} {{.VMNET_SOCK}} \
+          pkgx +qemu.org {{.QEMU_BIN}} $args
+
+  ssh:
+    desc: SSH into the running VM via its vmnet DHCP lease
+    cmds:
+      - |
+        set -eu
+        ip=$(awk -v mac='{{.GUEST_MAC}}' '
+          /ip_address=/ { ip=$0; sub(/.*=/,"",ip); sub(/[;]/,"",ip) }
+          /hw_address=1,/ {
+            hw=$0; sub(/.*hw_address=1,/,"",hw); sub(/[;]/,"",hw)
+            if (tolower(hw) == tolower(mac)) print ip
+          }' /var/db/dhcpd_leases | tail -1)
+        [ -n "$ip" ] || { echo 'no DHCP lease yet for {{.GUEST_MAC}}' >&2; exit 1; }
+        echo "VM ip : $ip"
+        exec ssh -o StrictHostKeyChecking=accept-new {{.GUEST_USER}}@$ip
+
+  down:
+    desc: Graceful ACPI shutdown via QMP
+    cmds:
+      - |
+        set -eu
+        test -S {{.QMP_SOCK}} || { echo 'VM not running (no QMP socket)' >&2; exit 1; }
+        printf '{"execute":"qmp_capabilities"}\n{"execute":"system_powerdown"}\n' \
+          | nc -U {{.QMP_SOCK}}
+        echo 'ACPI shutdown sent'
+
+  clean:
+    desc: Nuke disk + ISOs + http-served files
+    cmds:
+      - rm -f {{.DISK_PATH}} {{.ISO_STOCK}} {{.ISO_AUTO}} {{.EFI_VARS}} {{.QMP_SOCK}}
+      - rm -rf {{.HTTP_DIR}}
