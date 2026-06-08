@@ -20,6 +20,7 @@ import (
 
 	weftplugin "github.com/openweft/weft-driver-plugin"
 	vmddriver "github.com/openweft/weft-driver-vmd/builtin"
+	weftslognats "github.com/openweft/weft-slognats"
 )
 
 // Env vars the host passes through. None are required ; the defaults
@@ -32,9 +33,13 @@ const (
 )
 
 func main() {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	hostUUID := os.Getenv(weftplugin.EnvHostUUID)
+	logger, logCloser := weftslognats.SetupFromEnv("weft.driver.vmd." + hostUUID + ".log")
+	defer logCloser.Close()
+	slog.SetDefault(logger)
+
 	b, err := vmddriver.NewBundle(vmddriver.Options{
-		HostUUID:    os.Getenv(weftplugin.EnvHostUUID),
+		HostUUID:    hostUUID,
 		Hostname:    os.Getenv(weftplugin.EnvHostname),
 		VmctlBinary: os.Getenv(envVmctlBinary),
 		VmdSocket:   os.Getenv(envVmdSocket),
