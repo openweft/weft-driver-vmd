@@ -37,6 +37,7 @@ func main() {
 	logger, logCloser := weftslognats.SetupFromEnv("weft.driver.vmd." + hostUUID + ".log")
 	defer logCloser.Close()
 	slog.SetDefault(logger)
+	defer weftslognats.PanicReporter("weft-driver-vmd")
 
 	b, err := vmddriver.NewBundle(vmddriver.Options{
 		HostUUID:    hostUUID,
