@@ -21,17 +21,17 @@ import (
 //
 // Layout (host byte order = little-endian on amd64/arm64/riscv64) :
 //
-//   uint32_t  vmid               // 0 = new VM
-//   uint32_t  vcp_id             // ignored on start
-//   uint64_t  memranges_size     // we set memory inline below
-//   uint64_t  pad0
-//   char      name[64]
-//   uint32_t  nnics
-//   uint32_t  ndisks
-//   uint32_t  ncdroms
-//   uint32_t  nkernels
-//   // memory ranges + interfaces + disks follow as variable-length
-//   // arrays — we pin to one mem range, N nics, N disks, 0 cdroms.
+//	uint32_t  vmid               // 0 = new VM
+//	uint32_t  vcp_id             // ignored on start
+//	uint64_t  memranges_size     // we set memory inline below
+//	uint64_t  pad0
+//	char      name[64]
+//	uint32_t  nnics
+//	uint32_t  ndisks
+//	uint32_t  ncdroms
+//	uint32_t  nkernels
+//	// memory ranges + interfaces + disks follow as variable-length
+//	// arrays — we pin to one mem range, N nics, N disks, 0 cdroms.
 //
 // The actual vmd_create_params is more nuanced (memory ranges are a
 // typed array of vmop_create_params_memrange { addr, size, type }).
@@ -89,16 +89,16 @@ func (c *imsgClient) startVM(ctx context.Context, p vmStartParams) (uint32, erro
 //
 // Today we encode the SIMPLEST valid layout that vmd accepts :
 //
-//   uint32 vmid              = 0
-//   uint32 ifnum             = len(nics)
-//   uint64 nicmac[8]         = zeros (vmd will allocate)
-//   uint64 memory_size_bytes = mem_mib * 1MiB
-//   uint32 vcpus             = vcpus
-//   char   name[64]          = padded VM name
-//   uint32 ndisks            = len(disks)
-//   for each disk : 1024-byte filename buffer + uint32 disktype
-//   for each nic  : 64-byte switch name + uint32 nictype
-//   char   kernel[1024]      = boot kernel path
+//	uint32 vmid              = 0
+//	uint32 ifnum             = len(nics)
+//	uint64 nicmac[8]         = zeros (vmd will allocate)
+//	uint64 memory_size_bytes = mem_mib * 1MiB
+//	uint32 vcpus             = vcpus
+//	char   name[64]          = padded VM name
+//	uint32 ndisks            = len(disks)
+//	for each disk : 1024-byte filename buffer + uint32 disktype
+//	for each nic  : 64-byte switch name + uint32 nictype
+//	char   kernel[1024]      = boot kernel path
 //
 // This is a simplified, weft-internal shape ; the real vmd accepts
 // more fields. Operators wanting the full surface (CD-ROMs, custom
@@ -107,29 +107,29 @@ func encodeStartVM(p vmStartParams) []byte {
 	var buf bytes.Buffer
 
 	// Fixed-size header.
-	binary.Write(&buf, binary.LittleEndian, uint32(0))                       // vmid
-	binary.Write(&buf, binary.LittleEndian, uint32(len(p.Nics)))             // ifnum
+	binary.Write(&buf, binary.LittleEndian, uint32(0))           // vmid
+	binary.Write(&buf, binary.LittleEndian, uint32(len(p.Nics))) // ifnum
 	for i := 0; i < 8; i++ {
-		binary.Write(&buf, binary.LittleEndian, uint64(0))                   // pre-allocated MACs
+		binary.Write(&buf, binary.LittleEndian, uint64(0)) // pre-allocated MACs
 	}
-	binary.Write(&buf, binary.LittleEndian, uint64(p.MemMiB)*1024*1024)      // memory_size_bytes
-	binary.Write(&buf, binary.LittleEndian, uint32(p.VCPUs))                 // vcpus
+	binary.Write(&buf, binary.LittleEndian, uint64(p.MemMiB)*1024*1024) // memory_size_bytes
+	binary.Write(&buf, binary.LittleEndian, uint32(p.VCPUs))            // vcpus
 
 	name := vmName64(p.Name)
 	buf.Write(name[:])
 
-	binary.Write(&buf, binary.LittleEndian, uint32(len(p.Disks)))            // ndisks
+	binary.Write(&buf, binary.LittleEndian, uint32(len(p.Disks))) // ndisks
 
 	// Disks : each entry is 1024-byte filename + uint32 type (0 = raw).
 	for _, d := range p.Disks {
 		writePaddedString(&buf, d, 1024)
-		binary.Write(&buf, binary.LittleEndian, uint32(0))                   // disktype = raw
+		binary.Write(&buf, binary.LittleEndian, uint32(0)) // disktype = raw
 	}
 
 	// NICs : 64-byte switch name + uint32 type (0 = tap-on-bridge).
 	for _, n := range p.Nics {
 		writePaddedString(&buf, n, 64)
-		binary.Write(&buf, binary.LittleEndian, uint32(0))                   // nictype = bridge
+		binary.Write(&buf, binary.LittleEndian, uint32(0)) // nictype = bridge
 	}
 
 	// Boot kernel : 1024-byte path. Empty defaults to vmd's compiled-
@@ -154,9 +154,9 @@ func writePaddedString(w *bytes.Buffer, s string, width int) {
 // parseStartVMResponse extracts the assigned VM ID from a
 // IMSG_VMDOP_START_VM_RESPONSE message. The response shape is :
 //
-//   uint32 vmid           // the VM ID vmd assigned (or 0 on failure)
-//   uint32 error_code     // 0 = success
-//   char   error_string[256]
+//	uint32 vmid           // the VM ID vmd assigned (or 0 on failure)
+//	uint32 error_code     // 0 = success
+//	char   error_string[256]
 //
 // vmd returns the same message type whether the start succeeded or
 // failed ; we parse the error_code and surface it.
@@ -302,16 +302,16 @@ func (c *imsgClient) getInfoVMs(ctx context.Context) ([]vmInfo, error) {
 // decodeVMInfo extracts the fields we use from a GET_INFO_VM_RESPONSE
 // payload. Layout (from vmd.h `struct vmop_info_result`) :
 //
-//   struct vm_info_result {
-//       uint32_t vir_id;
-//       uint32_t vir_creator_pid;
-//       uint64_t vir_memory_size;
-//       uint32_t vir_ncpus;
-//       uint32_t vir_running;       // 1 if cpu0 has booted past initial
-//       char     vir_name[64];
-//       uint32_t vir_state;         // vm_state_t
-//       // ... more fields, ignored here
-//   };
+//	struct vm_info_result {
+//	    uint32_t vir_id;
+//	    uint32_t vir_creator_pid;
+//	    uint64_t vir_memory_size;
+//	    uint32_t vir_ncpus;
+//	    uint32_t vir_running;       // 1 if cpu0 has booted past initial
+//	    char     vir_name[64];
+//	    uint32_t vir_state;         // vm_state_t
+//	    // ... more fields, ignored here
+//	};
 func decodeVMInfo(payload []byte) (vmInfo, bool) {
 	// Minimum size we read = 4 + 4 + 8 + 4 + 4 + 64 + 4 = 92 bytes.
 	if len(payload) < 92 {

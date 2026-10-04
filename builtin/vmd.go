@@ -63,13 +63,13 @@ func (h *vmdHypervisor) dial() (*imsgClient, error) {
 // vmState is the persisted per-VM spec the driver re-reads at every
 // lifecycle call. Lives at StateDir/<uuid>/spec.json.
 type vmState struct {
-	UUID    string   `json:"uuid"`
-	Name    string   `json:"name"`
-	MemMiB  int      `json:"mem_mib"`
-	CPUs    int      `json:"cpus"`
-	Boot    string   `json:"boot,omitempty"` // kernel path, empty = vmd default ("/bsd")
-	Disks   []string `json:"disks"`          // ordered, first = root
-	NICs    []string `json:"nics"`           // ordered, switch names
+	UUID   string   `json:"uuid"`
+	Name   string   `json:"name"`
+	MemMiB int      `json:"mem_mib"`
+	CPUs   int      `json:"cpus"`
+	Boot   string   `json:"boot,omitempty"` // kernel path, empty = vmd default ("/bsd")
+	Disks  []string `json:"disks"`          // ordered, first = root
+	NICs   []string `json:"nics"`           // ordered, switch names
 }
 
 func (h *vmdHypervisor) vmDir(uuid string) string {

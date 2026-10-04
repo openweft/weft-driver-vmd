@@ -60,13 +60,13 @@ const (
 // vmd message types we use. Sourced from openbsd/src/usr.sbin/vmd/vmd.h
 // (IMSG_VMDOP_*). The numeric values are stable across releases.
 const (
-	imsgVmdopStartVMRequest     = 1
-	imsgVmdopStartVMResponse    = 2
-	imsgVmdopTerminateVMRequest = 5
+	imsgVmdopStartVMRequest      = 1
+	imsgVmdopStartVMResponse     = 2
+	imsgVmdopTerminateVMRequest  = 5
 	imsgVmdopTerminateVMResponse = 6
-	imsgVmdopGetInfoVMRequest   = 8
-	imsgVmdopGetInfoVMResponse  = 9
-	imsgVmdopGetInfoVMEndData   = 10
+	imsgVmdopGetInfoVMRequest    = 8
+	imsgVmdopGetInfoVMResponse   = 9
+	imsgVmdopGetInfoVMEndData    = 10
 )
 
 // vmdMaxName mirrors VMM_MAX_NAME_LEN — the per-VM name has to fit
