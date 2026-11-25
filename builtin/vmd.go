@@ -128,6 +128,9 @@ func (h *vmdHypervisor) CreateVM(ctx context.Context, spec drivers.VMSpec) error
 	if spec.UUID == "" {
 		return errors.New("CreateVM: empty uuid")
 	}
+	if err := RejectSecrets(spec); err != nil {
+		return err
+	}
 	s := &vmState{
 		UUID:   spec.UUID,
 		Name:   vmName(spec.UUID),

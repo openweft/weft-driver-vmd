@@ -7,6 +7,15 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking: `CreateVM` refuses any VM spec carrying a secret** (inline
+  or reference) with the constant error `ErrSecretsUnsupported`. The
+  driver has no vsock channel to deliver secrets safely and never falls
+  back to inlining them. `drivers.VMSpec` has no dedicated secret field,
+  so `RejectSecrets` inspects `Cmdline` and `Name` for secret-named keys
+  (secret, private_key, access_key, wireguard) and raw WireGuard keys.
+
 ### Added
 
 - **Operational driver via direct imsg(3) transport.** The driver
