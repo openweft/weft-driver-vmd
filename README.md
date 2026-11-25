@@ -13,6 +13,15 @@ hyperviseur native each :
 | qemu    | Linux   | QEMU/KVM                    |
 | **vmd** | OpenBSD | vmd(8) / vmctl(8) / vm.conf |
 
+## Secrets are refused
+
+This driver has no vsock channel, so it cannot deliver a guest secret
+(WireGuard private key, CubeFS access/secret keys, inline or by `*_ref`)
+safely, and it never falls back to inlining one. `CreateVM` returns
+`ErrSecretsUnsupported` when the spec's free-form fields (`Cmdline`,
+`Name`) carry a secret-named key or a raw WireGuard key. Use a driver with
+a vsock channel for workloads that need secrets.
+
 ## What it is
 
 [OpenBSD `vmd`](https://man.openbsd.org/vmd.8) is the OpenBSD kernel's
