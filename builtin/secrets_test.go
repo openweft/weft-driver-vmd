@@ -2,6 +2,8 @@ package builtin
 
 import (
 	"errors"
+	"log/slog"
+	"os"
 	"strings"
 	"testing"
 
@@ -40,9 +42,18 @@ func TestRejectSecrets(t *testing.T) {
 }
 
 func TestCreateVMRefusesSecrets(t *testing.T) {
-	h := &vmdHypervisor{}
+	h, _ := newVmdHypervisor(Options{StateDir: t.TempDir(), Logger: slog.New(slog.DiscardHandler)})
 	err := h.CreateVM(t.Context(), drivers.VMSpec{UUID: "u", Cmdline: "secret_key=abc"})
 	if !errors.Is(err, ErrSecretsUnsupported) {
 		t.Fatalf("CreateVM err = %v, want ErrSecretsUnsupported", err)
+	}
+	if _, err := os.Stat(h.specPath("u")); !os.IsNotExist(err) {
+		t.Fatalf("a refused spec was persisted: %v", err)
+	}
+	if err := h.CreateVM(t.Context(), drivers.VMSpec{UUID: "c", Cmdline: "console=ttyS0"}); err != nil {
+		t.Fatalf("clean spec refused: %v", err)
+	}
+	if _, err := os.Stat(h.specPath("c")); err != nil {
+		t.Fatalf("clean spec not persisted: %v", err)
 	}
 }

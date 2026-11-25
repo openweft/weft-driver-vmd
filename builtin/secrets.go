@@ -61,9 +61,6 @@ func carriesSecret(s string) bool {
 }
 
 func isWireguardKey(s string) bool {
-	if len(s) != 44 {
-		return false
-	}
 	b, err := base64.StdEncoding.DecodeString(s)
 	return err == nil && len(b) == 32
 }
